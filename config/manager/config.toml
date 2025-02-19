@@ -34,6 +34,19 @@ enable = false
 max_port = 700
 min_port = 500
 
+[gss]
+enable = false
+[gss.hostPort]
+max_port = 36000
+min_port = 16000
+[[gss.ipMap]]
+inner = "192.168.1.10"
+outer = "203.135.96.62"
+[[gss.ipMap]]
+inner = "192.168.1.11"
+outer = "203.135.96.49"
+
+
 [tencentcloud]
 enable = true
 [tencentcloud.clb]

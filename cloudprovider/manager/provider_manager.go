@@ -18,6 +18,8 @@ package manager
 
 import (
 	"context"
+
+	"github.com/openkruise/kruise-game/cloudprovider/gss"
 	"github.com/openkruise/kruise-game/cloudprovider/jdcloud"
 
 	"github.com/openkruise/kruise-game/apis/v1alpha1"
@@ -148,6 +150,16 @@ func NewProviderManager() (*ProviderManager, error) {
 			log.Errorf("Failed to initialize tencentcloud provider.because of %s", err.Error())
 		} else {
 			pm.RegisterCloudProvider(tcp, configs.TencentCloudOptions)
+		}
+	}
+
+	if configs.GssOptions.Valid() && configs.GssOptions.Enabled() {
+		// build and register tencent cloud  provider
+		tcp, err := gss.NewGssProvider()
+		if err != nil {
+			log.Errorf("Failed to initialize gss provider.because of %s", err.Error())
+		} else {
+			pm.RegisterCloudProvider(tcp, configs.GssOptions)
 		}
 	}
 

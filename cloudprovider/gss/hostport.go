@@ -184,8 +184,8 @@ func (hpp *GssHostPortPlugin) Init(c client.Client, options cloudprovider.CloudP
 	hpp.mutex.Lock()
 	defer hpp.mutex.Unlock()
 
-	hostPortOptions := options.(provideroptions.GssOptions).HostPort
-	hostIpMap := options.(provideroptions.GssOptions).IpMap
+	hostPortOptions := options.(provideroptions.GssOptions).HostPortOptions.Range
+	hostIpMap := options.(provideroptions.GssOptions).HostPortOptions.IpMap
 	for _, v := range hostIpMap {
 		hpp.ipMap[v.Inner] = v.Outer
 	}

@@ -1,27 +1,34 @@
 package options
 
 type GssOptions struct {
-	Enable   bool               `toml:"enable"`
-	HostPort GssHostPortOptions `toml:"hostPort"`
-	IpMap    []GssHostPortMAp   `toml:"ipMap"`
+	Enable          bool               `toml:"enable"`
+	HostPortOptions GssHostPortOptions `toml:"hostPort"`
 }
 
-type GssHostPortMAp struct {
+type GssHostPortMap struct {
 	Inner string `toml:"inner"`
 	Outer string `toml:"outer"`
 }
 
-type GssHostPortOptions struct {
+type GssHostPortRange struct {
 	MaxPort int32 `toml:"max_port"`
 	MinPort int32 `toml:"min_port"`
 }
 
+type GssHostPortOptions struct {
+	Range GssHostPortRange `toml:"range"`
+	IpMap []GssHostPortMap `toml:"ipMap"`
+}
+
 func (v GssOptions) Valid() bool {
-	slbOptions := v.HostPort
-	if slbOptions.MaxPort <= slbOptions.MinPort {
+	hostportOptions := v.HostPortOptions
+	if hostportOptions.Range.MaxPort <= hostportOptions.Range.MinPort {
 		return false
 	}
-	if slbOptions.MinPort <= 0 {
+	if hostportOptions.Range.MinPort <= 0 {
+		return false
+	}
+	if len(hostportOptions.IpMap) == 0 {
 		return false
 	}
 	return true

@@ -50,6 +50,7 @@ type CloudProviderConfig struct {
 	TencentCloudOptions       CloudProviderOptions
 	JdCloudOptions            CloudProviderOptions
 	HwCloudOptions            CloudProviderOptions
+	GssOptions                CloudProviderOptions
 }
 
 type tomlConfigs struct {
@@ -60,6 +61,7 @@ type tomlConfigs struct {
 	TencentCloud       options.TencentCloudOptions       `toml:"tencentcloud"`
 	JdCloud            options.JdCloudOptions            `toml:"jdcloud"`
 	HwCloud            options.HwCloudOptions            `toml:"hwcloud"`
+	Gss                options.GssOptions                `toml:"gss"`
 }
 
 func (cf *ConfigFile) Parse() *CloudProviderConfig {
@@ -76,6 +78,7 @@ func (cf *ConfigFile) Parse() *CloudProviderConfig {
 		TencentCloudOptions:       config.TencentCloud,
 		JdCloudOptions:            config.JdCloud,
 		HwCloudOptions:            config.HwCloud,
+		GssOptions:                config.Gss,
 	}
 }
 

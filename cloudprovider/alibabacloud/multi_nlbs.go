@@ -43,7 +43,8 @@ const (
 	AliasMultiNlbs   = "Multi-NLBs-Network"
 
 	// ConfigNames defined by OKG
-	NlbIdNamesConfigName = "NlbIdNames"
+	NlbIdNamesConfigName     = "NlbIdNames"
+	AllocatePolicyConfigName = "AllocatePolicy"
 
 	// service annotation defined by OKG
 	LBIDBelongIndexKey = "game.kruise.io/lb-belong-index"
@@ -52,6 +53,9 @@ const (
 	ServiceBelongNetworkTypeKey = "game.kruise.io/network-type"
 
 	ProtocolTCPUDP corev1.Protocol = "TCPUDP"
+
+	PrefixReadyReadinessGate = "service.readiness.alibabacloud.com/"
+	ServiceProxyName         = "service.kubernetes.io/service-proxy-name"
 )
 
 type MultiNlbsPlugin struct {
@@ -146,7 +150,25 @@ func initMultiLBCache(svcList []corev1.Service, maxPort, minPort int32, blockPor
 	return podAllocate, cache
 }
 
-func (m *MultiNlbsPlugin) OnPodAdded(client client.Client, pod *corev1.Pod, ctx context.Context) (*corev1.Pod, cperrors.PluginError) {
+func (m *MultiNlbsPlugin) OnPodAdded(c client.Client, pod *corev1.Pod, ctx context.Context) (*corev1.Pod, cperrors.PluginError) {
+	networkManager := utils.NewNetworkManager(pod, c)
+	networkConfig := networkManager.GetNetworkConfig()
+	conf, err := parseMultiNLBsConfig(networkConfig)
+	if err != nil {
+		return pod, cperrors.NewPluginError(cperrors.ParameterError, err.Error())
+	}
+	var lbNames []string
+	for _, lbName := range conf.lbNames {
+		if !util.IsStringInList(lbName, lbNames) {
+			lbNames = append(lbNames, lbName)
+		}
+	}
+	for _, lbName := range lbNames {
+		pod.Spec.ReadinessGates = append(pod.Spec.ReadinessGates, corev1.PodReadinessGate{
+			ConditionType: corev1.PodConditionType(PrefixReadyReadinessGate + pod.GetName() + "-" + strings.ToLower(lbName)),
+		})
+	}
+
 	return pod, nil
 }
 
@@ -166,7 +188,13 @@ func (m *MultiNlbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 		return pod, cperrors.ToPluginError(err, cperrors.InternalError)
 	}
 
-	for _, lbId := range conf.idList[0] {
+	podNsName := pod.GetNamespace() + "/" + pod.GetName()
+	podLbsPorts, err := m.allocate(conf, podNsName)
+	if err != nil {
+		return pod, cperrors.ToPluginError(err, cperrors.ParameterError)
+	}
+
+	for _, lbId := range conf.idList[podLbsPorts.index] {
 		// get svc
 		lbName := conf.lbNames[lbId]
 		svc := &corev1.Service{}
@@ -176,7 +204,7 @@ func (m *MultiNlbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 		}, svc)
 		if err != nil {
 			if errors.IsNotFound(err) {
-				service, err := m.consSvc(conf, pod, lbName, c, ctx)
+				service, err := m.consSvc(podLbsPorts, conf, pod, lbName, c, ctx)
 				if err != nil {
 					return pod, cperrors.ToPluginError(err, cperrors.ParameterError)
 				}
@@ -187,7 +215,7 @@ func (m *MultiNlbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 	}
 
 	endPoints := ""
-	for i, lbId := range conf.idList[0] {
+	for i, lbId := range conf.idList[podLbsPorts.index] {
 		// get svc
 		lbName := conf.lbNames[lbId]
 		svc := &corev1.Service{}
@@ -197,7 +225,7 @@ func (m *MultiNlbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 		}, svc)
 		if err != nil {
 			if errors.IsNotFound(err) {
-				service, err := m.consSvc(conf, pod, lbName, c, ctx)
+				service, err := m.consSvc(podLbsPorts, conf, pod, lbName, c, ctx)
 				if err != nil {
 					return pod, cperrors.ToPluginError(err, cperrors.ParameterError)
 				}
@@ -219,7 +247,7 @@ func (m *MultiNlbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 			if err != nil {
 				return pod, cperrors.NewPluginError(cperrors.InternalError, err.Error())
 			}
-			service, err := m.consSvc(conf, pod, lbName, c, ctx)
+			service, err := m.consSvc(podLbsPorts, conf, pod, lbName, c, ctx)
 			if err != nil {
 				return pod, cperrors.ToPluginError(err, cperrors.ParameterError)
 			}
@@ -240,6 +268,12 @@ func (m *MultiNlbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 
 		// network not ready
 		if svc.Status.LoadBalancer.Ingress == nil {
+			networkStatus.CurrentNetworkState = gamekruiseiov1alpha1.NetworkNotReady
+			pod, err = networkManager.UpdateNetworkStatus(*networkStatus, pod)
+			return pod, cperrors.ToPluginError(err, cperrors.InternalError)
+		}
+		_, readyCondition := util.GetPodConditionFromList(pod.Status.Conditions, corev1.PodReady)
+		if readyCondition == nil || readyCondition.Status == corev1.ConditionFalse {
 			networkStatus.CurrentNetworkState = gamekruiseiov1alpha1.NetworkNotReady
 			pod, err = networkManager.UpdateNetworkStatus(*networkStatus, pod)
 			return pod, cperrors.ToPluginError(err, cperrors.InternalError)
@@ -349,21 +383,17 @@ func init() {
 }
 
 type multiNLBsConfig struct {
-	lbNames     map[string]string
-	idList      [][]string
-	targetPorts []int
-	protocols   []corev1.Protocol
-	isFixed     bool
+	lbNames               map[string]string
+	idList                [][]string
+	targetPorts           []int
+	protocols             []corev1.Protocol
+	isFixed               bool
+	externalTrafficPolicy corev1.ServiceExternalTrafficPolicyType
+	allocatePolicy        string
 	*nlbHealthConfig
 }
 
-func (m *MultiNlbsPlugin) consSvc(conf *multiNLBsConfig, pod *corev1.Pod, lbName string, c client.Client, ctx context.Context) (*corev1.Service, error) {
-	podNsName := pod.GetNamespace() + "/" + pod.GetName()
-	podLbsPorts, err := m.allocate(conf, podNsName)
-	if err != nil {
-		return nil, err
-	}
-
+func (m *MultiNlbsPlugin) consSvc(podLbsPorts *lbsPorts, conf *multiNLBsConfig, pod *corev1.Pod, lbName string, c client.Client, ctx context.Context) (*corev1.Service, error) {
 	var selectId string
 	for _, lbId := range podLbsPorts.lbIds {
 		if conf.lbNames[lbId] == lbName {
@@ -427,12 +457,13 @@ func (m *MultiNlbsPlugin) consSvc(conf *multiNLBsConfig, pod *corev1.Pod, lbName
 			Annotations: svcAnnotations,
 			Labels: map[string]string{
 				ServiceBelongNetworkTypeKey: MultiNlbsNetwork,
+				ServiceProxyName:            "dummy",
 			},
 			OwnerReferences: getSvcOwnerReference(c, ctx, pod, conf.isFixed),
 		},
 		Spec: corev1.ServiceSpec{
 			AllocateLoadBalancerNodePorts: ptr.To[bool](false),
-			ExternalTrafficPolicy:         corev1.ServiceExternalTrafficPolicyTypeLocal,
+			ExternalTrafficPolicy:         conf.externalTrafficPolicy,
 			Type:                          corev1.ServiceTypeLoadBalancer,
 			Selector: map[string]string{
 				SvcSelectorKey: pod.GetName(),
@@ -468,26 +499,58 @@ func (m *MultiNlbsPlugin) allocate(conf *multiNLBsConfig, nsName string) (*lbsPo
 	}
 
 	// find allocated ports
-	for i := 0; i < len(m.cache); i++ {
-		sum := 0
+	switch conf.allocatePolicy {
+	case "default":
+		for i := 0; i < len(m.cache); i++ {
+			sum := 0
+			ports = make([]int32, 0)
+			for j := 0; j < len(m.cache[i]); j++ {
+				if !m.cache[i][j] {
+					ports = append(ports, int32(j)+m.minPort)
+					sum++
+					if sum == needNum {
+						index = i
+						break
+					}
+				}
+			}
+			if index != -1 {
+				break
+			}
+		}
+	case "balanced":
+		maxAvailable := 0
+		for i := 0; i < len(m.cache); i++ {
+			sum := 0
+			for j := 0; j < len(m.cache[i]); j++ {
+				if !m.cache[i][j] {
+					sum++
+				}
+			}
+			if sum > maxAvailable {
+				maxAvailable = sum
+				index = i
+			}
+		}
+		if maxAvailable < needNum {
+			return nil, fmt.Errorf("no available ports found")
+		}
 		ports = make([]int32, 0)
-		for j := 0; j < len(m.cache[i]); j++ {
-			if !m.cache[i][j] {
+		for j := 0; j < len(m.cache[index]); j++ {
+			if !m.cache[index][j] {
 				ports = append(ports, int32(j)+m.minPort)
-				sum++
-				if sum == needNum {
-					index = i
+				if len(ports) == needNum {
 					break
 				}
 			}
-		}
-		if index != -1 {
-			break
 		}
 	}
 
 	if index == -1 {
 		return nil, fmt.Errorf("no available ports found")
+	}
+	if index >= len(conf.idList) {
+		return nil, fmt.Errorf("NlbIdNames configuration have not synced")
 	}
 	for _, port := range ports {
 		m.cache[index][port-m.minPort] = true
@@ -527,6 +590,8 @@ func parseMultiNLBsConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) (*multi
 	ports := make([]int, 0)
 	protocols := make([]corev1.Protocol, 0)
 	isFixed := false
+	externalTrafficPolicy := corev1.ServiceExternalTrafficPolicyTypeLocal
+	allocatePolicy := "default"
 
 	for _, c := range conf {
 		switch c.Name {
@@ -571,6 +636,15 @@ func parseMultiNLBsConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) (*multi
 				return nil, fmt.Errorf("invalid Fixed %s", c.Value)
 			}
 			isFixed = v
+		case ExternalTrafficPolicyTypeConfigName:
+			if strings.EqualFold(c.Value, string(corev1.ServiceExternalTrafficPolicyTypeCluster)) {
+				externalTrafficPolicy = corev1.ServiceExternalTrafficPolicyTypeCluster
+			}
+		case AllocatePolicyConfigName:
+			allocatePolicy = c.Value
+			if allocatePolicy != "default" && allocatePolicy != "balanced" {
+				return nil, fmt.Errorf("invalid AllocatePolicy %s", allocatePolicy)
+			}
 		}
 	}
 
@@ -597,11 +671,13 @@ func parseMultiNLBsConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) (*multi
 	}
 
 	return &multiNLBsConfig{
-		lbNames:         lbNames,
-		idList:          idList,
-		targetPorts:     ports,
-		protocols:       protocols,
-		isFixed:         isFixed,
-		nlbHealthConfig: nlbHealthConfig,
+		lbNames:               lbNames,
+		idList:                idList,
+		targetPorts:           ports,
+		protocols:             protocols,
+		isFixed:               isFixed,
+		externalTrafficPolicy: externalTrafficPolicy,
+		allocatePolicy:        allocatePolicy,
+		nlbHealthConfig:       nlbHealthConfig,
 	}, nil
 }

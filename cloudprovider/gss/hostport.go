@@ -235,38 +235,6 @@ func (hpp *GssHostPortPlugin) Init(c client.Client, options cloudprovider.CloudP
 	return nil
 }
 
-func (hpp *GssHostPortPlugin) allocate(num int, nsname string) []int32 {
-	hpp.mutex.Lock()
-	defer hpp.mutex.Unlock()
-
-	hostPorts, index := selectPorts(hpp.amountStat, hpp.portAmount, num)
-	for _, hostPort := range hostPorts {
-		hpp.portAmount[hostPort]++
-		hpp.amountStat[index]--
-		if index+1 >= len(hpp.amountStat) {
-			hpp.amountStat = append(hpp.amountStat, 0)
-		}
-		hpp.amountStat[index+1]++
-	}
-
-	hpp.podAllocated[nsname] = util.Int32SliceToString(hostPorts, ",")
-	return hostPorts
-}
-
-func (hpp *GssHostPortPlugin) deAllocate(hostPorts []int32, nsname string) {
-	hpp.mutex.Lock()
-	defer hpp.mutex.Unlock()
-
-	for _, hostPort := range hostPorts {
-		amount := hpp.portAmount[hostPort]
-		hpp.portAmount[hostPort]--
-		hpp.amountStat[amount]--
-		hpp.amountStat[amount-1]++
-	}
-
-	delete(hpp.podAllocated, nsname)
-}
-
 func verifyContainerName(containerName string, pod *corev1.Pod) bool {
 	for _, container := range pod.Spec.Containers {
 		if container.Name == containerName {
@@ -338,26 +306,4 @@ func parseConfig(conf []gamekruiseiov1alpha1.NetworkConfParams, pod *corev1.Pod)
 		}
 	}
 	return containerPortsMap, containerProtocolsMap, numToAlloc
-}
-
-func selectPorts(amountStat []int, portAmount map[int32]int, num int) ([]int32, int) {
-	var index int
-	for i, total := range amountStat {
-		if total >= num {
-			index = i
-			break
-		}
-	}
-
-	hostPorts := make([]int32, 0)
-	for hostPort, amount := range portAmount {
-		if amount == index {
-			hostPorts = append(hostPorts, hostPort)
-			num--
-		}
-		if num == 0 {
-			break
-		}
-	}
-	return hostPorts, index
 }

@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/go-logr/logr/testr"
+	kruisePub "github.com/openkruise/kruise-api/apps/pub"
 	kruiseV1alpha1 "github.com/openkruise/kruise-api/apps/v1alpha1"
 	kruiseV1beta1 "github.com/openkruise/kruise-api/apps/v1beta1"
 	gameKruiseV1alpha1 "github.com/openkruise/kruise-game/apis/v1alpha1"
@@ -17,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -432,7 +435,7 @@ func TestSyncServiceQualities(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		actualNewSqConditions := syncServiceQualities(test.serviceQualities, test.podConditions, test.gs)
+		actualNewSqConditions := syncServiceQualities(test.serviceQualities, test.podConditions, test.gs, nil)
 		expectSpec := test.spec
 		expectNewSqConditions := test.newSqConditions
 		if !reflect.DeepEqual(test.gs.Spec, expectSpec) {
@@ -468,6 +471,244 @@ func TestSyncServiceQualities(t *testing.T) {
 				t.Errorf("case %d: expect sq condition %s exist, but actually not", i, expectNewSqCondition.Name)
 			}
 		}
+	}
+}
+
+// TestSyncServiceQualities_WithTemplate tests template variable support in ServiceQualityAction
+func TestSyncServiceQualities_WithTemplate(t *testing.T) {
+	fakeProbeTime := metav1.Now()
+
+	tests := []struct {
+		name                   string
+		serviceQualities       []gameKruiseV1alpha1.ServiceQuality
+		podConditions          []corev1.PodCondition
+		gs                     *gameKruiseV1alpha1.GameServer
+		expectOpsState         gameKruiseV1alpha1.OpsState
+		expectLabels           map[string]string
+		expectAnnotations      map[string]string
+		expectUpdatePriority   *intstr.IntOrString
+		expectDeletionPriority *intstr.IntOrString
+	}{
+		{
+			name: "template in annotations and labels",
+			serviceQualities: []gameKruiseV1alpha1.ServiceQuality{
+				{
+					Name:      "player-count",
+					Permanent: false,
+					ServiceQualityAction: []gameKruiseV1alpha1.ServiceQualityAction{
+						{
+							State: true,
+							Annotations: map[string]string{
+								"player-count": "{{.Result}}",
+								"info":         "players-{{.Result}}",
+							},
+							Labels: map[string]string{
+								"count": "{{.Result}}",
+							},
+						},
+					},
+				},
+			},
+			podConditions: []corev1.PodCondition{
+				{
+					Type:          "game.kruise.io/player-count",
+					Status:        corev1.ConditionTrue,
+					Message:       "42",
+					LastProbeTime: fakeProbeTime,
+				},
+			},
+			gs: &gameKruiseV1alpha1.GameServer{
+				Spec:   gameKruiseV1alpha1.GameServerSpec{},
+				Status: gameKruiseV1alpha1.GameServerStatus{},
+			},
+			expectAnnotations: map[string]string{
+				"player-count": "42",
+				"info":         "players-42",
+			},
+			expectLabels: map[string]string{
+				"count": "42",
+			},
+		},
+		{
+			name: "template with conditional in OpsState",
+			serviceQualities: []gameKruiseV1alpha1.ServiceQuality{
+				{
+					Name:      "health-check",
+					Permanent: false,
+					ServiceQualityAction: []gameKruiseV1alpha1.ServiceQualityAction{
+						{
+							State: true,
+							GameServerSpec: gameKruiseV1alpha1.GameServerSpec{
+								OpsState: "{{if eq .Result \"0\"}}WaitToBeDeleted{{else}}None{{end}}",
+							},
+							Labels: map[string]string{
+								"status": "{{if eq .Result \"0\"}}empty{{else}}active{{end}}",
+							},
+						},
+					},
+				},
+			},
+			podConditions: []corev1.PodCondition{
+				{
+					Type:          "game.kruise.io/health-check",
+					Status:        corev1.ConditionTrue,
+					Message:       "0",
+					LastProbeTime: fakeProbeTime,
+				},
+			},
+			gs: &gameKruiseV1alpha1.GameServer{
+				Spec:   gameKruiseV1alpha1.GameServerSpec{},
+				Status: gameKruiseV1alpha1.GameServerStatus{},
+			},
+			expectOpsState: gameKruiseV1alpha1.WaitToDelete,
+			expectLabels: map[string]string{
+				"status": "empty",
+			},
+		},
+		{
+			name: "template with comparison gt",
+			serviceQualities: []gameKruiseV1alpha1.ServiceQuality{
+				{
+					Name:      "load-check",
+					Permanent: false,
+					ServiceQualityAction: []gameKruiseV1alpha1.ServiceQualityAction{
+						{
+							State: true,
+							Labels: map[string]string{
+								"load-level": "{{if gt .Result \"80\"}}high{{else}}normal{{end}}",
+							},
+						},
+					},
+				},
+			},
+			podConditions: []corev1.PodCondition{
+				{
+					Type:          "game.kruise.io/load-check",
+					Status:        corev1.ConditionTrue,
+					Message:       "85",
+					LastProbeTime: fakeProbeTime,
+				},
+			},
+			gs: &gameKruiseV1alpha1.GameServer{
+				Spec:   gameKruiseV1alpha1.GameServerSpec{},
+				Status: gameKruiseV1alpha1.GameServerStatus{},
+			},
+			expectLabels: map[string]string{
+				"load-level": "high",
+			},
+		},
+		{
+			name: "template in UpdatePriority",
+			serviceQualities: []gameKruiseV1alpha1.ServiceQuality{
+				{
+					Name:      "player-priority",
+					Permanent: false,
+					ServiceQualityAction: []gameKruiseV1alpha1.ServiceQualityAction{
+						{
+							State: true,
+							GameServerSpec: gameKruiseV1alpha1.GameServerSpec{
+								// Template: player count as update priority
+								UpdatePriority: func() *intstr.IntOrString {
+									v := intstr.FromString("{{.Result}}")
+									return &v
+								}(),
+							},
+						},
+					},
+				},
+			},
+			podConditions: []corev1.PodCondition{
+				{
+					Type:          "game.kruise.io/player-priority",
+					Status:        corev1.ConditionTrue,
+					Message:       "75",
+					LastProbeTime: fakeProbeTime,
+				},
+			},
+			gs: &gameKruiseV1alpha1.GameServer{
+				Spec:   gameKruiseV1alpha1.GameServerSpec{},
+				Status: gameKruiseV1alpha1.GameServerStatus{},
+			},
+			expectUpdatePriority: func() *intstr.IntOrString {
+				v := intstr.FromInt(75)
+				return &v
+			}(),
+		},
+		{
+			name: "template in DeletionPriority with formula",
+			serviceQualities: []gameKruiseV1alpha1.ServiceQuality{
+				{
+					Name:      "player-based-deletion",
+					Permanent: false,
+					ServiceQualityAction: []gameKruiseV1alpha1.ServiceQualityAction{
+						{
+							State: true,
+							GameServerSpec: gameKruiseV1alpha1.GameServerSpec{
+								// Template: 0 players -> priority 1, else 100
+								DeletionPriority: func() *intstr.IntOrString {
+									v := intstr.FromString("{{if eq .Result \"0\"}}1{{else}}100{{end}}")
+									return &v
+								}(),
+							},
+						},
+					},
+				},
+			},
+			podConditions: []corev1.PodCondition{
+				{
+					Type:          "game.kruise.io/player-based-deletion",
+					Status:        corev1.ConditionTrue,
+					Message:       "0",
+					LastProbeTime: fakeProbeTime,
+				},
+			},
+			gs: &gameKruiseV1alpha1.GameServer{
+				Spec:   gameKruiseV1alpha1.GameServerSpec{},
+				Status: gameKruiseV1alpha1.GameServerStatus{},
+			},
+			expectDeletionPriority: func() *intstr.IntOrString {
+				v := intstr.FromInt(1)
+				return &v
+			}(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			syncServiceQualities(tt.serviceQualities, tt.podConditions, tt.gs, nil)
+
+			if tt.expectOpsState != "" && tt.gs.Spec.OpsState != tt.expectOpsState {
+				t.Errorf("expect OpsState %v but got %v", tt.expectOpsState, tt.gs.Spec.OpsState)
+			}
+
+			for k, v := range tt.expectLabels {
+				if tt.gs.GetLabels()[k] != v {
+					t.Errorf("expect label %s=%v but got %v", k, v, tt.gs.GetLabels()[k])
+				}
+			}
+
+			for k, v := range tt.expectAnnotations {
+				if tt.gs.GetAnnotations()[k] != v {
+					t.Errorf("expect annotation %s=%v but got %v", k, v, tt.gs.GetAnnotations()[k])
+				}
+			}
+
+			if tt.expectUpdatePriority != nil {
+				if tt.gs.Spec.UpdatePriority == nil {
+					t.Errorf("expect UpdatePriority %v but got nil", tt.expectUpdatePriority)
+				} else if tt.gs.Spec.UpdatePriority.String() != tt.expectUpdatePriority.String() {
+					t.Errorf("expect UpdatePriority %v but got %v", tt.expectUpdatePriority, tt.gs.Spec.UpdatePriority)
+				}
+			}
+
+			if tt.expectDeletionPriority != nil {
+				if tt.gs.Spec.DeletionPriority == nil {
+					t.Errorf("expect DeletionPriority %v but got nil", tt.expectDeletionPriority)
+				} else if tt.gs.Spec.DeletionPriority.String() != tt.expectDeletionPriority.String() {
+					t.Errorf("expect DeletionPriority %v but got %v", tt.expectDeletionPriority, tt.gs.Spec.DeletionPriority)
+				}
+			}
+		})
 	}
 }
 
@@ -559,9 +800,10 @@ func TestSyncGsToPod(t *testing.T) {
 			client:     c,
 			gameServer: test.gs,
 			pod:        test.pod,
+			logger:     testr.New(t),
 		}
 
-		if err := manager.SyncGsToPod(); err != nil {
+		if err := manager.SyncGsToPod(context.TODO(), nil); err != nil {
 			t.Error(err)
 		}
 
@@ -585,8 +827,9 @@ func TestSyncGsToPod(t *testing.T) {
 			t.Errorf("expect DeletionPriority is %s ,but actually is %s", test.gs.Spec.DeletionPriority.String(), pod.Labels[gameKruiseV1alpha1.GameServerDeletePriorityKey])
 		}
 
-		if pod.Labels[gameKruiseV1alpha1.GameServerNetworkDisabled] != strconv.FormatBool(test.gs.Spec.NetworkDisabled) {
-			t.Errorf("expect NetworkDisabled is %s ,but actually is %s", strconv.FormatBool(test.gs.Spec.NetworkDisabled), pod.Labels[gameKruiseV1alpha1.GameServerNetworkDisabled])
+		expectNetworkDisabled := strconv.FormatBool(ptr.Deref(test.gs.Spec.NetworkDisabled, false))
+		if pod.Labels[gameKruiseV1alpha1.GameServerNetworkDisabled] != expectNetworkDisabled {
+			t.Errorf("expect NetworkDisabled is %s ,but actually is %s", expectNetworkDisabled, pod.Labels[gameKruiseV1alpha1.GameServerNetworkDisabled])
 		}
 
 		for gsKey, gsValue := range test.gs.GetAnnotations() {
@@ -594,6 +837,210 @@ func TestSyncGsToPod(t *testing.T) {
 				t.Errorf("expect gs annotation %s is %s ,but actually is %s", gsKey, gsValue, pod.Annotations[gsKey])
 			}
 		}
+	}
+}
+
+func TestUpdatingContainersAnnotation(t *testing.T) {
+	tests := []struct {
+		name                     string
+		gs                       *gameKruiseV1alpha1.GameServer
+		pod                      *corev1.Pod
+		gss                      *gameKruiseV1alpha1.GameServerSet
+		expectPodAnnotation      string
+		expectPodAnnotationExist bool
+	}{
+		{
+			name: "PreUpdate state sets updating-containers on pod",
+			gs: &gameKruiseV1alpha1.GameServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "xxx",
+					Name:      "xxx-0",
+					Labels: map[string]string{
+						gameKruiseV1alpha1.GameServerOwnerGssKey: "xxx",
+					},
+				},
+				Spec: gameKruiseV1alpha1.GameServerSpec{},
+			},
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "xxx",
+					Name:      "xxx-0",
+					Labels: map[string]string{
+						kruisePub.LifecycleStateKey: string(kruisePub.LifecycleStatePreparingUpdate),
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{
+						{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+					},
+					ContainerStatuses: []corev1.ContainerStatus{
+						{Name: "app", Image: "v1.0"},
+						{Name: "sidecar", Image: "v1.0"},
+					},
+				},
+			},
+			gss: &gameKruiseV1alpha1.GameServerSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "xxx",
+					Name:      "xxx",
+				},
+				Spec: gameKruiseV1alpha1.GameServerSetSpec{
+					GameServerTemplate: gameKruiseV1alpha1.GameServerTemplate{
+						PodTemplateSpec: corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{
+									{Name: "app", Image: "v2.0"},
+									{Name: "sidecar", Image: "v1.0"},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectPodAnnotation:      "app",
+			expectPodAnnotationExist: true,
+		},
+		{
+			name: "Updating state keeps existing annotation unchanged",
+			gs: &gameKruiseV1alpha1.GameServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "xxx",
+					Name:      "xxx-0",
+					Labels: map[string]string{
+						gameKruiseV1alpha1.GameServerOwnerGssKey: "xxx",
+					},
+				},
+				Spec: gameKruiseV1alpha1.GameServerSpec{},
+			},
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "xxx",
+					Name:      "xxx-0",
+					Labels: map[string]string{
+						kruisePub.LifecycleStateKey: string(kruisePub.LifecycleStateUpdating),
+					},
+					Annotations: map[string]string{
+						gameKruiseV1alpha1.GameServerUpdatingContainersKey: "app",
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{
+						{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+					},
+					ContainerStatuses: []corev1.ContainerStatus{
+						{Name: "app", Image: "v2.0"},
+						{Name: "sidecar", Image: "v1.0"},
+					},
+				},
+			},
+			gss: &gameKruiseV1alpha1.GameServerSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "xxx",
+					Name:      "xxx",
+				},
+				Spec: gameKruiseV1alpha1.GameServerSetSpec{
+					GameServerTemplate: gameKruiseV1alpha1.GameServerTemplate{
+						PodTemplateSpec: corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{
+									{Name: "app", Image: "v2.0"},
+									{Name: "sidecar", Image: "v1.0"},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectPodAnnotation:      "app",
+			expectPodAnnotationExist: true,
+		},
+		{
+			name: "non-PreUpdate state removes updating-containers from pod",
+			gs: &gameKruiseV1alpha1.GameServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "xxx",
+					Name:      "xxx-0",
+					Labels: map[string]string{
+						gameKruiseV1alpha1.GameServerOwnerGssKey: "xxx",
+					},
+				},
+				Spec: gameKruiseV1alpha1.GameServerSpec{},
+			},
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "xxx",
+					Name:      "xxx-0",
+					Annotations: map[string]string{
+						gameKruiseV1alpha1.GameServerUpdatingContainersKey: "app",
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{
+						{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+					},
+					ContainerStatuses: []corev1.ContainerStatus{
+						{Name: "app", Image: "v2.0"},
+						{Name: "sidecar", Image: "v1.0"},
+					},
+				},
+			},
+			gss: &gameKruiseV1alpha1.GameServerSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "xxx",
+					Name:      "xxx",
+				},
+				Spec: gameKruiseV1alpha1.GameServerSetSpec{
+					GameServerTemplate: gameKruiseV1alpha1.GameServerTemplate{
+						PodTemplateSpec: corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{
+									{Name: "app", Image: "v2.0"},
+									{Name: "sidecar", Image: "v1.0"},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectPodAnnotation:      "",
+			expectPodAnnotationExist: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			objs := []client.Object{test.gs, test.pod}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+			manager := &GameServerManager{
+				client:     c,
+				gameServer: test.gs,
+				pod:        test.pod,
+				logger:     testr.New(t),
+			}
+
+			if err := manager.SyncGsToPod(context.TODO(), test.gss); err != nil {
+				t.Fatal(err)
+			}
+
+			pod := &corev1.Pod{}
+			if err := c.Get(context.TODO(), types.NamespacedName{
+				Namespace: test.pod.Namespace,
+				Name:      test.pod.Name,
+			}, pod); err != nil {
+				t.Fatal(err)
+			}
+
+			val, exists := pod.Annotations[gameKruiseV1alpha1.GameServerUpdatingContainersKey]
+			if exists != test.expectPodAnnotationExist {
+				t.Errorf("expect annotation exists=%v, got exists=%v", test.expectPodAnnotationExist, exists)
+			}
+			if val != test.expectPodAnnotation {
+				t.Errorf("expect annotation value=%q, got %q", test.expectPodAnnotation, val)
+			}
+		})
 	}
 }
 
@@ -747,6 +1194,7 @@ func TestSyncNetworkStatus(t *testing.T) {
 			client:     c,
 			gameServer: test.gs,
 			pod:        test.pod,
+			logger:     testr.New(t),
 		}
 
 		actual := manager.syncNetworkStatus()
@@ -805,7 +1253,7 @@ func TestSyncPodContainers(t *testing.T) {
 
 	for i, test := range tests {
 		expect := test.newContainers
-		manager := &GameServerManager{}
+		manager := &GameServerManager{logger: testr.New(t)}
 		actual := manager.syncPodContainers(test.gsContainers, test.podContainers)
 		if !reflect.DeepEqual(expect, actual) {
 			t.Errorf("case %d: expect newContainers %v, but actually got %v", i, expect, actual)
@@ -936,9 +1384,10 @@ func TestSyncPodToGs(t *testing.T) {
 			client:     c,
 			gameServer: test.gs,
 			pod:        test.pod,
+			logger:     testr.New(t),
 		}
 
-		if err := manager.SyncPodToGs(test.gss); err != nil {
+		if err := manager.SyncPodToGs(context.TODO(), test.gss); err != nil {
 			t.Error(err)
 		}
 
@@ -955,6 +1404,13 @@ func TestSyncPodToGs(t *testing.T) {
 		for key, value := range test.gss.Spec.GameServerTemplate.GetLabels() {
 			if gsLabels[key] != value {
 				t.Errorf("case %d: expect label %s=%s exists on gs, but actually not", i, key, value)
+			}
+		}
+
+		// gs nodeName label
+		if test.pod.Spec.NodeName != "" {
+			if gsLabels[gameKruiseV1alpha1.GameServerNodeNameKey] != test.pod.Spec.NodeName {
+				t.Errorf("case %d: expect nodeName label %s=%s exists on gs, but actually %s", i, gameKruiseV1alpha1.GameServerNodeNameKey, test.pod.Spec.NodeName, gsLabels[gameKruiseV1alpha1.GameServerNodeNameKey])
 			}
 		}
 

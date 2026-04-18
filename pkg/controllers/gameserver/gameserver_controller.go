@@ -20,8 +20,13 @@ import (
 	"context"
 	"flag"
 	"reflect"
+	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,6 +50,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	gamekruiseiov1alpha1 "github.com/openkruise/kruise-game/apis/v1alpha1"
+	"github.com/openkruise/kruise-game/pkg/logging"
+	"github.com/openkruise/kruise-game/pkg/telemetryfields"
+	"github.com/openkruise/kruise-game/pkg/tracing"
 	cpmanager "github.com/openkruise/kruise-game/cloudprovider/manager"
 	"github.com/openkruise/kruise-game/pkg/util"
 	utildiscovery "github.com/openkruise/kruise-game/pkg/util/discovery"
@@ -79,7 +87,7 @@ func newReconciler(mgr manager.Manager, cpm *cpmanager.ProviderManager) reconcil
 
 func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	// Create a new controller
-	klog.Info("Starting GameServer Controller")
+	klog.InfoS("Starting controller", "event", "controller.start", "controller", "gameserver", "workers", concurrentReconciles)
 	c, err := controller.New("gameserver-controller", mgr, controller.Options{Reconciler: r, MaxConcurrentReconciles: concurrentReconciles})
 	if err != nil {
 		klog.Error(err)
@@ -112,8 +120,8 @@ type GameServerReconciler struct {
 }
 
 func watchPod(mgr manager.Manager, c controller.Controller) error {
-	if err := c.Watch(source.Kind(mgr.GetCache(), &corev1.Pod{}, &handler.TypedFuncs[*corev1.Pod]{
-		CreateFunc: func(ctx context.Context, createEvent event.TypedCreateEvent[*corev1.Pod], limitingInterface workqueue.RateLimitingInterface) {
+	if err := c.Watch(source.Kind(mgr.GetCache(), &corev1.Pod{}, &handler.TypedFuncs[*corev1.Pod, reconcile.Request]{
+		CreateFunc: func(ctx context.Context, createEvent event.TypedCreateEvent[*corev1.Pod], limitingInterface workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 			pod := createEvent.Object
 			if _, exist := pod.GetLabels()[gamekruiseiov1alpha1.GameServerOwnerGssKey]; exist {
 				limitingInterface.Add(reconcile.Request{NamespacedName: types.NamespacedName{
@@ -122,7 +130,7 @@ func watchPod(mgr manager.Manager, c controller.Controller) error {
 				}})
 			}
 		},
-		UpdateFunc: func(ctx context.Context, updateEvent event.TypedUpdateEvent[*corev1.Pod], limitingInterface workqueue.RateLimitingInterface) {
+		UpdateFunc: func(ctx context.Context, updateEvent event.TypedUpdateEvent[*corev1.Pod], limitingInterface workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 			newPod := updateEvent.ObjectNew
 			if _, exist := newPod.GetLabels()[gamekruiseiov1alpha1.GameServerOwnerGssKey]; exist {
 				limitingInterface.Add(reconcile.Request{NamespacedName: types.NamespacedName{
@@ -131,7 +139,7 @@ func watchPod(mgr manager.Manager, c controller.Controller) error {
 				}})
 			}
 		},
-		DeleteFunc: func(ctx context.Context, deleteEvent event.TypedDeleteEvent[*corev1.Pod], limitingInterface workqueue.RateLimitingInterface) {
+		DeleteFunc: func(ctx context.Context, deleteEvent event.TypedDeleteEvent[*corev1.Pod], limitingInterface workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 			pod := deleteEvent.Object
 			if _, exist := pod.GetLabels()[gamekruiseiov1alpha1.GameServerOwnerGssKey]; exist {
 				limitingInterface.Add(reconcile.Request{
@@ -152,8 +160,8 @@ func watchNode(mgr manager.Manager, c controller.Controller) error {
 	cli := mgr.GetClient()
 
 	// watch node condition change
-	if err := c.Watch(source.Kind(mgr.GetCache(), &corev1.Node{}, &handler.TypedFuncs[*corev1.Node]{
-		UpdateFunc: func(ctx context.Context, updateEvent event.TypedUpdateEvent[*corev1.Node], limitingInterface workqueue.RateLimitingInterface) {
+	if err := c.Watch(source.Kind(mgr.GetCache(), &corev1.Node{}, &handler.TypedFuncs[*corev1.Node, reconcile.Request]{
+		UpdateFunc: func(ctx context.Context, updateEvent event.TypedUpdateEvent[*corev1.Node], limitingInterface workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 			nodeNew := updateEvent.ObjectNew
 			nodeOld := updateEvent.ObjectOld
 			if reflect.DeepEqual(nodeNew.Status.Conditions, nodeOld.Status.Conditions) {
@@ -198,9 +206,25 @@ func watchNode(mgr manager.Manager, c controller.Controller) error {
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.12.1/pkg/reconcile
+
 func (r *GameServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = log.FromContext(ctx)
 	namespacedName := req.NamespacedName
+
+	// Create root span for Reconcile (SERVER span kind)
+	tracer := otel.Tracer("okg-controller-manager")
+	ctx, span := tracer.Start(ctx, tracing.SpanReconcileGameServer,
+		trace.WithSpanKind(trace.SpanKindServer),
+		trace.WithAttributes(
+			tracing.AttrK8sNamespaceName(namespacedName.Namespace),
+			tracing.AttrGameServerNamespace(namespacedName.Namespace),
+			tracing.AttrGameServerName(namespacedName.Name),
+		))
+	defer span.End()
+
+	logger := logging.FromContextWithTrace(ctx).WithValues(
+		telemetryfields.FieldGameServerNamespace, req.Namespace,
+		telemetryfields.FieldGameServerName, req.Name,
+	)
 
 	// get pod
 	pod := &corev1.Pod{}
@@ -210,7 +234,11 @@ func (r *GameServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if errors.IsNotFound(err) {
 			podFound = false
 		} else {
-			klog.Errorf("failed to find pod %s in %s, because of %s.", namespacedName.Name, namespacedName.Namespace, err.Error())
+			logger.Error(err, "failed to find pod",
+				telemetryfields.FieldGameServerNamespace, namespacedName.Namespace,
+				telemetryfields.FieldGameServerName, namespacedName.Name)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to get pod")
 			return reconcile.Result{}, err
 		}
 	}
@@ -223,63 +251,157 @@ func (r *GameServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if errors.IsNotFound(err) {
 			gsFound = false
 		} else {
-			klog.Errorf("failed to find GameServer %s in %s, because of %s.", namespacedName.Name, namespacedName.Namespace, err.Error())
+			logger.Error(err, "failed to find GameServer",
+				telemetryfields.FieldGameServerNamespace, namespacedName.Namespace,
+				telemetryfields.FieldGameServerName, namespacedName.Name)
 			return reconcile.Result{}, err
 		}
 	}
 
+	gssName := ""
+	if podFound {
+		gssName = pod.GetLabels()[gamekruiseiov1alpha1.GameServerOwnerGssKey]
+	}
+	if gssName == "" && gsFound {
+		gssName = gs.GetLabels()[gamekruiseiov1alpha1.GameServerOwnerGssKey]
+	}
+	if gssName == "" {
+		if idx := strings.LastIndex(namespacedName.Name, "-"); idx > 0 {
+			gssName = namespacedName.Name[:idx]
+		}
+	}
+	if gssName != "" {
+		span.SetAttributes(
+			tracing.AttrGameServerSetName(gssName),
+			tracing.AttrGameServerSetNamespace(namespacedName.Namespace),
+		)
+		logger = logger.WithValues(
+			telemetryfields.FieldGameServerSetNamespace, namespacedName.Namespace,
+			telemetryfields.FieldGameServerSetName, gssName,
+		)
+	}
+
 	if podFound && !gsFound {
-		gss, err := r.getGameServerSet(pod)
+		span.SetAttributes(tracing.AttrReconcileTrigger("create"))
+		span.AddEvent(tracing.EventGameServerReconcileBootstrap,
+			trace.WithAttributes(
+				attribute.String("action", "init gameserver from pod"),
+				attribute.String(telemetryfields.FieldK8sPodUID, string(pod.GetUID())),
+			))
+		gss, err := r.getGameServerSet(ctx, pod)
 		if err != nil {
 			if errors.IsNotFound(err) {
 				return reconcile.Result{}, nil
 			}
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to get GameServerSet")
 			return reconcile.Result{}, err
 		}
-		err = r.initGameServerByPod(gss, pod)
+		err = r.initGameServerByPod(ctx, gss, pod)
 		if err != nil && !errors.IsAlreadyExists(err) {
-			klog.Errorf("failed to create GameServer %s in %s, because of %s.", namespacedName.Name, namespacedName.Namespace, err.Error())
+			logger.Error(err, "failed to create GameServer",
+				telemetryfields.FieldGameServerNamespace, namespacedName.Namespace,
+				telemetryfields.FieldGameServerName, namespacedName.Name)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to create GameServer")
 			return reconcile.Result{}, err
 		}
+		span.AddEvent(tracing.EventGameServerReconcileGameServerInitialized,
+			trace.WithAttributes(
+				tracing.AttrGameServerName(pod.GetName()),
+				attribute.String("gss", gss.GetName()),
+			))
 		return reconcile.Result{}, nil
 	}
 
 	if !podFound {
-		if gsFound && gs.GetLabels()[gamekruiseiov1alpha1.GameServerDeletingKey] == "true" {
-			err := r.Client.Delete(context.Background(), gs)
+		span.SetAttributes(tracing.AttrReconcileTrigger("delete"))
+		shouldDelete := gsFound && gs.GetLabels()[gamekruiseiov1alpha1.GameServerDeletingKey] == "true"
+		span.AddEvent(tracing.EventGameServerReconcileCleanup,
+			trace.WithAttributes(
+				tracing.AttrGameServerName(namespacedName.Name),
+				attribute.Bool("markedForDeletion", shouldDelete),
+			))
+		if shouldDelete {
+			err := r.Delete(ctx, gs)
 			if err != nil && !errors.IsNotFound(err) {
-				klog.Errorf("failed to delete GameServer %s in %s, because of %s.", namespacedName.Name, namespacedName.Namespace, err.Error())
+				logger.Error(err, "failed to delete GameServer",
+					telemetryfields.FieldGameServerNamespace, namespacedName.Namespace,
+					telemetryfields.FieldGameServerName, namespacedName.Name)
+				span.RecordError(err)
+				span.SetStatus(codes.Error, "failed to delete GameServer")
 				return reconcile.Result{}, err
 			}
 		}
 		return reconcile.Result{}, nil
 	}
 
-	gsm := NewGameServerManager(gs, pod, r.Client, r.recorder, r.cpm)
+	span.SetAttributes(tracing.AttrReconcileTrigger("update"))
 
-	gss, err := r.getGameServerSet(pod)
+	gsm := NewGameServerManager(gs, pod, r.Client, r.recorder, logger, r.cpm)
+
+	span.AddEvent(tracing.EventGameServerReconcileManagerReady,
+		trace.WithAttributes(
+			tracing.AttrGameServerName(gs.GetName()),
+			attribute.String(telemetryfields.FieldK8sPodUID, string(pod.GetUID())),
+		))
+	gss, err := r.getGameServerSet(ctx, pod)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
-		klog.Errorf("failed to get GameServerSet for GameServer %s in %s, because of %s.", namespacedName.Name, namespacedName.Namespace, err.Error())
+		logger.Error(err, "failed to get GameServerSet",
+			telemetryfields.FieldGameServerNamespace, namespacedName.Namespace,
+			telemetryfields.FieldGameServerName, namespacedName.Name)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to get GameServerSet")
 		return reconcile.Result{}, err
 	}
 
-	err = gsm.SyncGsToPod()
+	span.AddEvent(tracing.EventGameServerReconcileSyncGsToPodStart,
+		trace.WithAttributes(
+			tracing.AttrGameServerSetName(gss.GetName()),
+			tracing.AttrGameServerName(gs.GetName()),
+		))
+	err = gsm.SyncGsToPod(ctx, gss)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "SyncGsToPod failed")
 		return reconcile.Result{RequeueAfter: 3 * time.Second}, err
 	}
+	span.AddEvent(tracing.EventGameServerReconcileSyncGsToPodSuccess,
+		trace.WithAttributes(
+			attribute.Int(telemetryfields.FieldPodLabelCount, len(pod.GetLabels())),
+			attribute.Int(telemetryfields.FieldPodAnnotationCount, len(pod.GetAnnotations())),
+		))
 
-	err = gsm.SyncPodToGs(gss)
+	span.AddEvent(tracing.EventGameServerReconcileSyncPodToGsStart,
+		trace.WithAttributes(
+			tracing.AttrGameServerSetName(gss.GetName()),
+			tracing.AttrGameServerName(gs.GetName()),
+		))
+	err = gsm.SyncPodToGs(ctx, gss)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "SyncPodToGs failed")
 		return reconcile.Result{}, err
 	}
+	span.AddEvent(tracing.EventGameServerReconcileSyncPodToGsSuccess,
+		trace.WithAttributes(
+			attribute.String(telemetryfields.FieldGameServerResourceVersion, gs.ResourceVersion),
+		))
 
 	if gsm.WaitOrNot() {
+		span.AddEvent(tracing.EventGameServerReconcileWaitNetworkState,
+			trace.WithAttributes(
+				attribute.String(telemetryfields.FieldDesired, string(gs.Status.NetworkStatus.DesiredNetworkState)),
+				attribute.String(telemetryfields.FieldCurrent, string(gs.Status.NetworkStatus.CurrentNetworkState)),
+			))
+		span.SetAttributes(tracing.AttrReconcileRequeue(true))
 		return ctrl.Result{RequeueAfter: NetworkIntervalTime}, nil
 	}
 
+	span.SetStatus(codes.Ok, "Reconcile completed successfully")
 	return ctrl.Result{}, nil
 }
 
@@ -290,17 +412,17 @@ func (r *GameServerReconciler) SetupWithManager(mgr ctrl.Manager) (c controller.
 	return c, err
 }
 
-func (r *GameServerReconciler) getGameServerSet(pod *corev1.Pod) (*gamekruiseiov1alpha1.GameServerSet, error) {
+func (r *GameServerReconciler) getGameServerSet(ctx context.Context, pod *corev1.Pod) (*gamekruiseiov1alpha1.GameServerSet, error) {
 	gssName := pod.GetLabels()[gamekruiseiov1alpha1.GameServerOwnerGssKey]
 	gss := &gamekruiseiov1alpha1.GameServerSet{}
-	err := r.Client.Get(context.Background(), types.NamespacedName{
+	err := r.Get(ctx, types.NamespacedName{
 		Namespace: pod.GetNamespace(),
 		Name:      gssName,
 	}, gss)
 	return gss, err
 }
 
-func (r *GameServerReconciler) initGameServerByPod(gss *gamekruiseiov1alpha1.GameServerSet, pod *corev1.Pod) error {
+func (r *GameServerReconciler) initGameServerByPod(ctx context.Context, gss *gamekruiseiov1alpha1.GameServerSet, pod *corev1.Pod) error {
 	// default fields
 	gs := util.InitGameServer(gss, pod.Name)
 
@@ -319,5 +441,5 @@ func (r *GameServerReconciler) initGameServerByPod(gss *gamekruiseiov1alpha1.Gam
 		gs.OwnerReferences = ors
 	}
 
-	return r.Client.Create(context.Background(), gs)
+	return r.Create(ctx, gs)
 }

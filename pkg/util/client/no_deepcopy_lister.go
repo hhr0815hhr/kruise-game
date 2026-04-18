@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -85,11 +86,6 @@ func (r *noDeepCopyLister) List(ctx context.Context, out client.ObjectList, opts
 
 	runtimeObjs := make([]runtime.Object, 0, len(objs))
 	for _, item := range objs {
-		// if the Limit option is set and the number of items
-		// listed exceeds this limit, then stop reading.
-		if limitSet && int64(len(runtimeObjs)) >= listOpts.Limit {
-			break
-		}
 		obj, isObj := item.(runtime.Object)
 		if !isObj {
 			return fmt.Errorf("cache contained %T, which is not an Object", obj)
@@ -105,6 +101,20 @@ func (r *noDeepCopyLister) List(ctx context.Context, out client.ObjectList, opts
 			}
 		}
 		runtimeObjs = append(runtimeObjs, obj)
+	}
+	sort.SliceStable(runtimeObjs, func(i, j int) bool {
+		iMeta, _ := apimeta.Accessor(runtimeObjs[i])
+		jMeta, _ := apimeta.Accessor(runtimeObjs[j])
+		if iMeta.GetNamespace() == jMeta.GetNamespace() {
+			return iMeta.GetName() < jMeta.GetName()
+		}
+		return iMeta.GetNamespace() < jMeta.GetNamespace()
+	})
+	if limitSet && int64(len(runtimeObjs)) > listOpts.Limit {
+		limit := int(listOpts.Limit)
+		if limit < len(runtimeObjs) {
+			runtimeObjs = runtimeObjs[:limit]
+		}
 	}
 	defer func() {
 		klog.V(6).Infof("Listed %v %v objects %v without DeepCopy, cost %v", gvk.GroupVersion(), gvk.Kind, len(runtimeObjs), time.Since(startTime))
@@ -152,7 +162,7 @@ func (r *noDeepCopyLister) objectTypeForListObject(list client.ObjectList) (*sch
 		// http://knowyourmeme.com/memes/this-is-fine
 		elemType := reflect.Indirect(reflect.ValueOf(itemsPtr)).Type().Elem()
 		if elemType.Kind() != reflect.Ptr {
-			elemType = reflect.PtrTo(elemType)
+			elemType = reflect.PointerTo(elemType)
 		}
 
 		cacheTypeValue := reflect.Zero(elemType)

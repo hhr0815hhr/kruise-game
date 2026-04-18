@@ -1,6 +1,9 @@
 
 # Image URL to use all building/pushing images targets
 IMG ?= kruise-game-manager:test
+# Compute version metadata from git when available. Fallback to dev-<sha> via helper script.
+VERSION ?= $(shell ./hack/compute-version.sh 2>/dev/null || git describe --tags --dirty --always 2>/dev/null || echo dev)
+LDFLAGS ?= -X github.com/openkruise/kruise-game/pkg/version.Version=$(VERSION)
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.30.0
 
@@ -63,15 +66,15 @@ test: manifests generate fmt vet envtest ## Run tests.
 
 .PHONY: build
 build: generate fmt vet ## Build manager binary.
-	go build -o bin/manager main.go
+	go build -ldflags "$(LDFLAGS)" -o bin/manager main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./main.go
+	go run -ldflags "$(LDFLAGS)" ./main.go
 
 .PHONY: docker-build
 docker-build: ## Build docker images with the manager.
-	docker build -t ${IMG} .
+	docker build --build-arg LDFLAGS="$(LDFLAGS)" -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker images with the manager.
@@ -115,6 +118,8 @@ ENVTEST ?= $(LOCALBIN)/setup-envtest
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v4.5.5
 CONTROLLER_TOOLS_VERSION ?= v0.16.5
+GOLANGCI_VERSION ?= v2.6.2
+GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
 
 KUSTOMIZE_INSTALL_SCRIPT ?= "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh"
 .PHONY: kustomize
@@ -138,3 +143,16 @@ helm: ## Download helm locally if necessary.
 
 ginkgo: ## Download ginkgo locally if necessary.
 	GOBIN=$(LOCALBIN) go install github.com/onsi/ginkgo/ginkgo@v1.16.5
+
+.PHONY: golangci-lint
+golangci-lint: $(LOCALBIN) ## Download golangci-lint locally if necessary.
+ifeq (,$(wildcard $(GOLANGCI_LINT)))
+	@echo "Installing golangci-lint $(GOLANGCI_VERSION) to $(LOCALBIN)"
+	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(LOCALBIN) $(GOLANGCI_VERSION)
+else
+	@echo "golangci-lint already present at $(GOLANGCI_LINT)"
+endif
+
+.PHONY: lint
+lint: golangci-lint fmt vet ## Run linters (gofmt, go vet, golangci-lint).
+	$(GOLANGCI_LINT) run --verbose --timeout=10m

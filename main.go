@@ -214,7 +214,7 @@ func main() {
 	}
 
 	setupLog.Info("setup controllers")
-	if err = controller.SetupWithManager(mgr); err != nil {
+	if err = controller.SetupWithManager(mgr, cloudProviderManager); err != nil {
 		setupLog.Error(err, "unable to setup controllers")
 		os.Exit(1)
 	}

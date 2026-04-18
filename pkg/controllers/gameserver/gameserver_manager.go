@@ -18,8 +18,14 @@ package gameserver
 
 import (
 	"context"
+	"reflect"
+	"strconv"
+	"strings"
+	"time"
+
 	kruisePub "github.com/openkruise/kruise-api/apps/pub"
 	gameKruiseV1alpha1 "github.com/openkruise/kruise-game/apis/v1alpha1"
+	cpmanager "github.com/openkruise/kruise-game/cloudprovider/manager"
 	"github.com/openkruise/kruise-game/cloudprovider/utils"
 	"github.com/openkruise/kruise-game/pkg/util"
 	corev1 "k8s.io/api/core/v1"
@@ -30,11 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
-	"reflect"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"strconv"
-	"strings"
-	"time"
 )
 
 var (
@@ -66,6 +68,7 @@ type GameServerManager struct {
 	pod           *corev1.Pod
 	client        client.Client
 	eventRecorder record.EventRecorder
+	cpm           *cpmanager.ProviderManager
 }
 
 func isNeedToSyncMetadata(gss *gameKruiseV1alpha1.GameServerSet, gs *gameKruiseV1alpha1.GameServer) bool {
@@ -249,6 +252,42 @@ func (manager GameServerManager) SyncPodToGs(gss *gameKruiseV1alpha1.GameServerS
 	oldGsLabels := gs.GetLabels()
 	oldGsAnnotations := gs.GetAnnotations()
 	oldGsStatus := *gs.Status.DeepCopy()
+
+	// 主动更新网络状态 - 在控制器中主动调用网络插件更新网络状态
+	// 只在网络状态不是 Ready 时才主动更新，避免不必要的 API 调用
+	if manager.cpm != nil {
+		nm := utils.NewNetworkManager(pod, manager.client)
+		if nm != nil {
+			podNetworkStatus, _ := nm.GetNetworkStatus()
+			// 只在网络状态不是 Ready 时才主动更新
+			if podNetworkStatus == nil || podNetworkStatus.CurrentNetworkState != gameKruiseV1alpha1.NetworkReady {
+				if plugin, found := manager.cpm.FindAvailablePlugins(pod); found {
+					updatedPod, pluginErr := plugin.OnPodUpdated(manager.client, pod, context.Background())
+					if pluginErr != nil {
+						klog.Warningf("Failed to update network status for GameServer %s/%s: %v", gs.Namespace, gs.Name, pluginErr)
+					} else if updatedPod != nil && !reflect.DeepEqual(pod.Annotations, updatedPod.Annotations) {
+						patchAnnotations := map[string]interface{}{
+							"metadata": map[string]interface{}{
+								"annotations": updatedPod.Annotations,
+							},
+						}
+						patchBytes, err := json.Marshal(patchAnnotations)
+						if err != nil {
+							klog.Errorf("Failed to marshal network status patch for GameServer %s/%s: %v", gs.Namespace, gs.Name, err)
+						} else {
+							err = manager.client.Patch(context.TODO(), pod, client.RawPatch(types.MergePatchType, patchBytes))
+							if err != nil && !errors.IsNotFound(err) {
+								klog.Warningf("Failed to patch network status for GameServer %s/%s: %v", gs.Namespace, gs.Name, err)
+							} else if err == nil {
+								klog.Infof("Successfully updated network status for GameServer %s/%s", gs.Namespace, gs.Name)
+								pod = updatedPod
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 
 	// sync DeletePriority/UpdatePriority/State
 	podLabels := pod.GetLabels()
@@ -449,11 +488,12 @@ func (manager GameServerManager) syncPodContainers(gsContainers []gameKruiseV1al
 	return newContainers
 }
 
-func NewGameServerManager(gs *gameKruiseV1alpha1.GameServer, pod *corev1.Pod, c client.Client, recorder record.EventRecorder) Control {
+func NewGameServerManager(gs *gameKruiseV1alpha1.GameServer, pod *corev1.Pod, c client.Client, recorder record.EventRecorder, cpm *cpmanager.ProviderManager) Control {
 	return &GameServerManager{
 		gameServer:    gs,
 		pod:           pod,
 		client:        c,
 		eventRecorder: recorder,
+		cpm:           cpm,
 	}
 }

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	cpmanager "github.com/openkruise/kruise-game/cloudprovider/manager"
 	"github.com/openkruise/kruise-game/pkg/controllers/gameserver"
 	"github.com/openkruise/kruise-game/pkg/controllers/gameserverset"
 	corev1 "k8s.io/api/core/v1"
@@ -27,14 +28,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
-var controllerAddFuncs []func(manager.Manager) error
+var controllerAddFuncs []func(manager.Manager, *cpmanager.ProviderManager) error
 
 func init() {
 	controllerAddFuncs = append(controllerAddFuncs, gameserver.Add)
 	controllerAddFuncs = append(controllerAddFuncs, gameserverset.Add)
 }
 
-func SetupWithManager(m manager.Manager) error {
+func SetupWithManager(m manager.Manager, cpm *cpmanager.ProviderManager) error {
 	if err := m.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, "spec.nodeName", func(rawObj client.Object) []string {
 		pod := rawObj.(*corev1.Pod)
 		return []string{pod.Spec.NodeName}
@@ -43,7 +44,7 @@ func SetupWithManager(m manager.Manager) error {
 	}
 
 	for _, f := range controllerAddFuncs {
-		if err := f(m); err != nil {
+		if err := f(m, cpm); err != nil {
 			if kindMatchErr, ok := err.(*meta.NoKindMatchError); ok {
 				klog.Infof("CRD %v is not installed, its controller will perform noops!", kindMatchErr.GroupKind)
 				continue

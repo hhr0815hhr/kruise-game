@@ -22,6 +22,7 @@ import (
 
 	kruisev1alpha1 "github.com/openkruise/kruise-api/apps/v1alpha1"
 	kruiseV1beta1 "github.com/openkruise/kruise-api/apps/v1beta1"
+	cpmanager "github.com/openkruise/kruise-game/cloudprovider/manager"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -58,7 +59,7 @@ var (
 	concurrentReconciles = 10
 )
 
-func Add(mgr manager.Manager) error {
+func Add(mgr manager.Manager, _ *cpmanager.ProviderManager) error {
 	if !utildiscovery.DiscoverGVK(controllerKind) {
 		return nil
 	}

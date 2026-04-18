@@ -45,6 +45,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	gamekruiseiov1alpha1 "github.com/openkruise/kruise-game/apis/v1alpha1"
+	cpmanager "github.com/openkruise/kruise-game/cloudprovider/manager"
 	"github.com/openkruise/kruise-game/pkg/util"
 	utildiscovery "github.com/openkruise/kruise-game/pkg/util/discovery"
 )
@@ -59,19 +60,20 @@ var (
 	concurrentReconciles = 10
 )
 
-func Add(mgr manager.Manager) error {
+func Add(mgr manager.Manager, cpm *cpmanager.ProviderManager) error {
 	if !utildiscovery.DiscoverGVK(controllerKind) {
 		return nil
 	}
-	return add(mgr, newReconciler(mgr))
+	return add(mgr, newReconciler(mgr, cpm))
 }
 
-func newReconciler(mgr manager.Manager) reconcile.Reconciler {
+func newReconciler(mgr manager.Manager, cpm *cpmanager.ProviderManager) reconcile.Reconciler {
 	recorder := mgr.GetEventRecorderFor("gameserver-controller")
 	return &GameServerReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		recorder: recorder,
+		cpm:      cpm,
 	}
 }
 
@@ -106,6 +108,7 @@ type GameServerReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	recorder record.EventRecorder
+	cpm      *cpmanager.ProviderManager
 }
 
 func watchPod(mgr manager.Manager, c controller.Controller) error {
@@ -252,7 +255,7 @@ func (r *GameServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return reconcile.Result{}, nil
 	}
 
-	gsm := NewGameServerManager(gs, pod, r.Client, r.recorder)
+	gsm := NewGameServerManager(gs, pod, r.Client, r.recorder, r.cpm)
 
 	gss, err := r.getGameServerSet(pod)
 	if err != nil {

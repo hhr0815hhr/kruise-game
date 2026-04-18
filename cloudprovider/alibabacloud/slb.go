@@ -193,7 +193,7 @@ func (s *SlbPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx context.C
 			}
 			return pod, cperrors.ToPluginError(c.Create(ctx, service), cperrors.ApiCallError)
 		}
-		return pod, cperrors.NewPluginError(cperrors.ApiCallError, err.Error())
+		return pod, cperrors.NewPluginErrorWithMessage(cperrors.ApiCallError, err.Error())
 	}
 
 	// old svc remain
@@ -207,11 +207,11 @@ func (s *SlbPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx context.C
 		networkStatus.CurrentNetworkState = gamekruiseiov1alpha1.NetworkNotReady
 		pod, err = networkManager.UpdateNetworkStatus(*networkStatus, pod)
 		if err != nil {
-			return pod, cperrors.NewPluginError(cperrors.InternalError, err.Error())
+			return pod, cperrors.NewPluginErrorWithMessage(cperrors.InternalError, err.Error())
 		}
 		service, err := s.consSvc(sc, pod, c, ctx)
 		if err != nil {
-			return pod, cperrors.NewPluginError(cperrors.ParameterError, err.Error())
+			return pod, cperrors.NewPluginErrorWithMessage(cperrors.ParameterError, err.Error())
 		}
 		return pod, cperrors.ToPluginError(c.Update(ctx, service), cperrors.ApiCallError)
 	}
@@ -229,7 +229,7 @@ func (s *SlbPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx context.C
 	}
 
 	// network not ready
-	if svc.Status.LoadBalancer.Ingress == nil {
+	if len(svc.Status.LoadBalancer.Ingress) == 0 {
 		networkStatus.CurrentNetworkState = gamekruiseiov1alpha1.NetworkNotReady
 		pod, err = networkManager.UpdateNetworkStatus(*networkStatus, pod)
 		return pod, cperrors.ToPluginError(err, cperrors.InternalError)
@@ -291,7 +291,7 @@ func (s *SlbPlugin) OnPodDeleted(c client.Client, pod *corev1.Pod, ctx context.C
 	networkConfig := networkManager.GetNetworkConfig()
 	sc, err := parseLbConfig(networkConfig)
 	if err != nil {
-		return cperrors.NewPluginError(cperrors.ParameterError, err.Error())
+		return cperrors.NewPluginErrorWithMessage(cperrors.ParameterError, err.Error())
 	}
 
 	var podKeys []string
@@ -582,14 +582,14 @@ func (s *SlbPlugin) consSvc(sc *slbConfig, pod *corev1.Pod, c client.Client, ctx
 	for i := 0; i < len(sc.targetPorts); i++ {
 		if sc.protocols[i] == ProtocolTCPUDP {
 			svcPorts = append(svcPorts, corev1.ServicePort{
-				Name:       fmt.Sprintf("%s-%s", strconv.Itoa(sc.targetPorts[i]), corev1.ProtocolTCP),
+				Name:       strconv.Itoa(sc.targetPorts[i]) + "-" + strings.ToLower(string(corev1.ProtocolTCP)),
 				Port:       ports[i],
 				Protocol:   corev1.ProtocolTCP,
 				TargetPort: intstr.FromInt(sc.targetPorts[i]),
 			})
 
 			svcPorts = append(svcPorts, corev1.ServicePort{
-				Name:       fmt.Sprintf("%s-%s", strconv.Itoa(sc.targetPorts[i]), corev1.ProtocolUDP),
+				Name:       strconv.Itoa(sc.targetPorts[i]) + "-" + strings.ToLower(string(corev1.ProtocolUDP)),
 				Port:       ports[i],
 				Protocol:   corev1.ProtocolUDP,
 				TargetPort: intstr.FromInt(sc.targetPorts[i]),
@@ -597,7 +597,7 @@ func (s *SlbPlugin) consSvc(sc *slbConfig, pod *corev1.Pod, c client.Client, ctx
 
 		} else {
 			svcPorts = append(svcPorts, corev1.ServicePort{
-				Name:       fmt.Sprintf("%s-%s", strconv.Itoa(sc.targetPorts[i]), sc.protocols[i]),
+				Name:       strconv.Itoa(sc.targetPorts[i]) + "-" + strings.ToLower(string(sc.protocols[i])),
 				Port:       ports[i],
 				Protocol:   sc.protocols[i],
 				TargetPort: intstr.FromInt(sc.targetPorts[i]),

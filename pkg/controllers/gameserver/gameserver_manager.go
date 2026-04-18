@@ -18,10 +18,20 @@ package gameserver
 
 import (
 	"context"
+	"reflect"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-logr/logr"
 	kruisePub "github.com/openkruise/kruise-api/apps/pub"
 	gameKruiseV1alpha1 "github.com/openkruise/kruise-game/apis/v1alpha1"
 	"github.com/openkruise/kruise-game/cloudprovider/utils"
+	"github.com/openkruise/kruise-game/pkg/telemetryfields"
+	"github.com/openkruise/kruise-game/pkg/tracing"
 	"github.com/openkruise/kruise-game/pkg/util"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,12 +39,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/klog/v2"
-	"reflect"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"strconv"
-	"strings"
-	"time"
 )
 
 var (
@@ -54,9 +60,9 @@ const (
 type Control interface {
 	// SyncGsToPod compares the pod with GameServer, and decide whether to update the pod based on the results.
 	// When the fields of the pod is different from that of GameServer, pod will be updated.
-	SyncGsToPod() error
+	SyncGsToPod(context.Context, *gameKruiseV1alpha1.GameServerSet) error
 	// SyncPodToGs compares the GameServer with pod, and update the GameServer.
-	SyncPodToGs(*gameKruiseV1alpha1.GameServerSet) error
+	SyncPodToGs(context.Context, *gameKruiseV1alpha1.GameServerSet) error
 	// WaitOrNot compare the current game server network status to decide whether to re-queue.
 	WaitOrNot() bool
 }
@@ -66,6 +72,7 @@ type GameServerManager struct {
 	pod           *corev1.Pod
 	client        client.Client
 	eventRecorder record.EventRecorder
+	logger        logr.Logger
 }
 
 func isNeedToSyncMetadata(gss *gameKruiseV1alpha1.GameServerSet, gs *gameKruiseV1alpha1.GameServer) bool {
@@ -85,7 +92,7 @@ func syncMetadataFromGss(gss *gameKruiseV1alpha1.GameServerSet) metav1.ObjectMet
 	}
 }
 
-func (manager GameServerManager) SyncGsToPod() error {
+func (manager GameServerManager) SyncGsToPod(ctx context.Context, gss *gameKruiseV1alpha1.GameServerSet) error {
 	pod := manager.pod
 	gs := manager.gameServer
 	podLabels := pod.GetLabels()
@@ -97,16 +104,25 @@ func (manager GameServerManager) SyncGsToPod() error {
 
 	newLabels := make(map[string]string)
 	newAnnotations := make(map[string]string)
-	if gs.Spec.DeletionPriority.String() != podDeletePriority {
-		newLabels[gameKruiseV1alpha1.GameServerDeletePriorityKey] = gs.Spec.DeletionPriority.String()
+	deleteAnnotations := make(map[string]struct{})
+	// tolerate nil pointers in spec priorities
+	var gsDpStr, gsUpStr string
+	if gs.Spec.DeletionPriority != nil {
+		gsDpStr = gs.Spec.DeletionPriority.String()
+	}
+	if gs.Spec.UpdatePriority != nil {
+		gsUpStr = gs.Spec.UpdatePriority.String()
+	}
+	if gsDpStr != podDeletePriority {
+		newLabels[gameKruiseV1alpha1.GameServerDeletePriorityKey] = gsDpStr
 		if podDeletePriority != "" {
-			manager.eventRecorder.Eventf(gs, corev1.EventTypeNormal, StateReason, "DeletionPriority turn from %s to %s ", podDeletePriority, gs.Spec.DeletionPriority.String())
+			manager.eventRecorder.Eventf(gs, corev1.EventTypeNormal, StateReason, "DeletionPriority turn from %s to %s ", podDeletePriority, gsDpStr)
 		}
 	}
-	if gs.Spec.UpdatePriority.String() != podUpdatePriority {
-		newLabels[gameKruiseV1alpha1.GameServerUpdatePriorityKey] = gs.Spec.UpdatePriority.String()
+	if gsUpStr != podUpdatePriority {
+		newLabels[gameKruiseV1alpha1.GameServerUpdatePriorityKey] = gsUpStr
 		if podUpdatePriority != "" {
-			manager.eventRecorder.Eventf(gs, corev1.EventTypeNormal, StateReason, "UpdatePriority turn from %s to %s ", podUpdatePriority, gs.Spec.UpdatePriority.String())
+			manager.eventRecorder.Eventf(gs, corev1.EventTypeNormal, StateReason, "UpdatePriority turn from %s to %s ", podUpdatePriority, gsUpStr)
 		}
 	}
 	if string(gs.Spec.OpsState) != podGsOpsState {
@@ -120,10 +136,11 @@ func (manager GameServerManager) SyncGsToPod() error {
 			manager.eventRecorder.Eventf(gs, eventType, StateReason, "OpsState turn from %s to %s ", podGsOpsState, string(gs.Spec.OpsState))
 		}
 	}
-	if podNetworkDisabled != strconv.FormatBool(gs.Spec.NetworkDisabled) {
-		newLabels[gameKruiseV1alpha1.GameServerNetworkDisabled] = strconv.FormatBool(gs.Spec.NetworkDisabled)
+	currentNetworkDisabled := strconv.FormatBool(ptr.Deref(gs.Spec.NetworkDisabled, false))
+	if podNetworkDisabled != currentNetworkDisabled {
+		newLabels[gameKruiseV1alpha1.GameServerNetworkDisabled] = currentNetworkDisabled
 		if podNetworkDisabled != "" {
-			manager.eventRecorder.Eventf(gs, corev1.EventTypeNormal, StateReason, "NetworkDisabled turn from %s to %s ", podNetworkDisabled, strconv.FormatBool(gs.Spec.NetworkDisabled))
+			manager.eventRecorder.Eventf(gs, corev1.EventTypeNormal, StateReason, "NetworkDisabled turn from %s to %s ", podNetworkDisabled, currentNetworkDisabled)
 		}
 	}
 
@@ -183,15 +200,40 @@ func (manager GameServerManager) SyncGsToPod() error {
 	if pod.Annotations[gameKruiseV1alpha1.GameServerNetworkType] != "" {
 		oldTime, err := time.Parse(TimeFormat, pod.Annotations[gameKruiseV1alpha1.GameServerNetworkTriggerTime])
 		if err != nil {
-			klog.Errorf("Failed to parse previous network trigger time for GameServer %s/%s: %v", gs.Namespace, gs.Name, err)
+			manager.logger.Error(err, "failed to parse previous network trigger time",
+				telemetryfields.FieldGameServerNamespace, gs.Namespace,
+				telemetryfields.FieldGameServerName, gs.Name)
 			newAnnotations[gameKruiseV1alpha1.GameServerNetworkTriggerTime] = time.Now().Format(TimeFormat)
 		} else {
 			timeSinceOldTrigger := time.Since(oldTime)
 			timeSinceNetworkTransition := time.Since(gs.Status.NetworkStatus.LastTransitionTime.Time)
 			if timeSinceOldTrigger > NetworkIntervalTime && timeSinceNetworkTransition < NetworkTotalWaitTime {
-				klog.V(4).Infof("GameServer %s/%s network trigger conditions met, updating trigger time", gs.Namespace, gs.Name)
+				manager.logger.V(4).Info("network trigger conditions met, updating trigger time",
+					telemetryfields.FieldGameServerNamespace, gs.Namespace,
+					telemetryfields.FieldGameServerName, gs.Name)
 				newAnnotations[gameKruiseV1alpha1.GameServerNetworkTriggerTime] = time.Now().Format(TimeFormat)
 			}
+		}
+	}
+
+	// sync GameServerUpdatingContainersKey annotation: when Pod enters the PreUpdate state,
+	// compute the diff container names and write them to the annotation; during the Updating
+	// state, keep the annotation as-is so that hooks can consume it; in any other state,
+	// remove the annotation to clean up after the update is complete.
+	switch gsState {
+	case gameKruiseV1alpha1.PreUpdate:
+		if gss != nil {
+			diffNames := util.GetDiffContainerNames(pod, gss)
+			updatingValue := strings.Join(diffNames, ",")
+			if pod.GetAnnotations()[gameKruiseV1alpha1.GameServerUpdatingContainersKey] != updatingValue {
+				newAnnotations[gameKruiseV1alpha1.GameServerUpdatingContainersKey] = updatingValue
+			}
+		}
+	case gameKruiseV1alpha1.Updating:
+		// keep the existing annotation unchanged so that hooks can read it
+	default:
+		if _, exists := pod.GetAnnotations()[gameKruiseV1alpha1.GameServerUpdatingContainersKey]; exists {
+			deleteAnnotations[gameKruiseV1alpha1.GameServerUpdatingContainersKey] = struct{}{}
 		}
 	}
 
@@ -220,10 +262,40 @@ func (manager GameServerManager) SyncGsToPod() error {
 	// sync pod containers when the containers(images) in GameServer are different from that in pod.
 	containers := manager.syncPodContainers(gs.Spec.Containers, pod.DeepCopy().Spec.Containers)
 
-	if len(newLabels) != 0 || len(newAnnotations) != 0 || containers != nil {
+	if len(newLabels) != 0 || len(newAnnotations) != 0 || len(deleteAnnotations) != 0 || containers != nil {
+		addManagerSpanEvent(ctx, "gameserver.manager.patch_pod",
+			tracing.AttrGameServerName(gs.GetName()),
+			attribute.String(telemetryfields.FieldK8sPodName, pod.GetName()),
+			attribute.Int("labels", len(newLabels)),
+			attribute.Int("annotations", len(newAnnotations)+len(deleteAnnotations)),
+			attribute.Bool("containersUpdated", containers != nil),
+		)
+
+		// Add traceparent annotation to propagate trace context to Webhook
+		spanContext := trace.SpanContextFromContext(ctx)
+		if spanContext.IsValid() {
+			traceparent := tracing.GenerateTraceparent(spanContext)
+			if traceparent != "" {
+				if len(newAnnotations) == 0 {
+					newAnnotations = make(map[string]string)
+				}
+				newAnnotations[telemetryfields.AnnotationTraceparent] = traceparent
+			}
+		}
+
 		patchPod := make(map[string]interface{})
-		if len(newLabels) != 0 || len(newAnnotations) != 0 {
-			patchPod["metadata"] = map[string]map[string]string{"labels": newLabels, "annotations": newAnnotations}
+		if len(newLabels) != 0 || len(newAnnotations) != 0 || len(deleteAnnotations) != 0 {
+			// merge newAnnotations and deleteAnnotations into a single map[string]interface{}
+			// so that nil values produce JSON null for strategic-merge-patch deletion.
+			mergedAnnotations := make(map[string]interface{}, len(newAnnotations)+len(deleteAnnotations))
+			for k, v := range newAnnotations {
+				mergedAnnotations[k] = v
+			}
+			for k := range deleteAnnotations {
+				mergedAnnotations[k] = nil
+			}
+
+			patchPod["metadata"] = map[string]interface{}{"labels": newLabels, "annotations": mergedAnnotations}
 		}
 		if containers != nil {
 			patchPod["spec"] = map[string]interface{}{"containers": containers}
@@ -232,9 +304,11 @@ func (manager GameServerManager) SyncGsToPod() error {
 		if err != nil {
 			return err
 		}
-		err = manager.client.Patch(context.TODO(), pod, client.RawPatch(types.StrategicMergePatchType, patchPodBytes))
+		err = manager.client.Patch(ctx, pod, client.RawPatch(types.StrategicMergePatchType, patchPodBytes))
 		if err != nil && !errors.IsNotFound(err) {
-			klog.Errorf("failed to patch Pod %s in %s,because of %s.", pod.GetName(), pod.GetNamespace(), err.Error())
+			manager.logger.Error(err, "failed to patch Pod",
+				telemetryfields.FieldGameServerNamespace, pod.GetNamespace(),
+				telemetryfields.FieldGameServerName, pod.GetName())
 			return err
 		}
 	}
@@ -242,12 +316,18 @@ func (manager GameServerManager) SyncGsToPod() error {
 	return nil
 }
 
-func (manager GameServerManager) SyncPodToGs(gss *gameKruiseV1alpha1.GameServerSet) error {
+func (manager GameServerManager) SyncPodToGs(ctx context.Context, gss *gameKruiseV1alpha1.GameServerSet) error {
 	gs := manager.gameServer
 	pod := manager.pod
 	oldGsSpec := gs.Spec.DeepCopy()
-	oldGsLabels := gs.GetLabels()
-	oldGsAnnotations := gs.GetAnnotations()
+	oldGsLabels := make(map[string]string)
+	for k, v := range gs.GetLabels() {
+		oldGsLabels[k] = v
+	}
+	oldGsAnnotations := make(map[string]string)
+	for k, v := range gs.GetAnnotations() {
+		oldGsAnnotations[k] = v
+	}
 	oldGsStatus := *gs.Status.DeepCopy()
 
 	// sync DeletePriority/UpdatePriority/State
@@ -257,7 +337,7 @@ func (manager GameServerManager) SyncPodToGs(gss *gameKruiseV1alpha1.GameServerS
 	podGsState := gameKruiseV1alpha1.GameServerState(podLabels[gameKruiseV1alpha1.GameServerStateKey])
 
 	// sync Service Qualities
-	sqConditions := syncServiceQualities(gss.Spec.ServiceQualities, pod.Status.Conditions, gs)
+	sqConditions := syncServiceQualities(gss.Spec.ServiceQualities, pod.Status.Conditions, gs, manager.eventRecorder)
 
 	// sync Metadata from Gss
 	if isNeedToSyncMetadata(gss, gs) {
@@ -266,24 +346,90 @@ func (manager GameServerManager) SyncPodToGs(gss *gameKruiseV1alpha1.GameServerS
 		gs.SetAnnotations(util.MergeMapString(gs.GetAnnotations(), gsMetadata.GetAnnotations()))
 	}
 
-	if !reflect.DeepEqual(oldGsSpec, gs.Spec) || !reflect.DeepEqual(oldGsLabels, gs.GetLabels()) || !reflect.DeepEqual(oldGsAnnotations, gs.GetAnnotations()) {
-		// patch gs spec & metadata
-		patchSpec := map[string]interface{}{"spec": gs.Spec, "metadata": map[string]interface{}{"labels": gs.GetLabels(), "annotations": gs.GetAnnotations()}}
-		jsonPatchSpec, err := json.Marshal(patchSpec)
-		if err != nil {
-			return err
+	// sync nodeName from pod to gs label
+	if pod.Spec.NodeName != "" {
+		gsLabels := gs.GetLabels()
+		if gsLabels == nil {
+			gsLabels = make(map[string]string)
 		}
-		err = manager.client.Patch(context.TODO(), gs, client.RawPatch(types.MergePatchType, jsonPatchSpec))
-		if err != nil && !errors.IsNotFound(err) {
-			klog.Errorf("failed to patch GameServer spec %s in %s,because of %s.", gs.GetName(), gs.GetNamespace(), err.Error())
-			return err
+		if gsLabels[gameKruiseV1alpha1.GameServerNodeNameKey] != pod.Spec.NodeName {
+			gsLabels[gameKruiseV1alpha1.GameServerNodeNameKey] = pod.Spec.NodeName
+			gs.SetLabels(gsLabels)
+		}
+	}
+
+	if !reflect.DeepEqual(oldGsSpec, gs.Spec) || !reflect.DeepEqual(oldGsLabels, gs.GetLabels()) || !reflect.DeepEqual(oldGsAnnotations, gs.GetAnnotations()) {
+		// Build a minimal patch to avoid clobbering fields updated concurrently by users/tests.
+		// Only include fields we actually changed and that the controller owns.
+		patch := make(map[string]interface{})
+
+		// Spec subfields: restrict to opsState, updatePriority, deletionPriority, networkDisabled
+		if !reflect.DeepEqual(oldGsSpec, gs.Spec) {
+			specPatch := make(map[string]interface{})
+			// opsState
+			if oldGsSpec.OpsState != gs.Spec.OpsState {
+				specPatch["opsState"] = gs.Spec.OpsState
+			}
+			// updatePriority
+			if (oldGsSpec.UpdatePriority == nil) != (gs.Spec.UpdatePriority == nil) ||
+				(oldGsSpec.UpdatePriority != nil && gs.Spec.UpdatePriority != nil && *oldGsSpec.UpdatePriority != *gs.Spec.UpdatePriority) {
+				specPatch["updatePriority"] = gs.Spec.UpdatePriority
+			}
+			// deletionPriority
+			if (oldGsSpec.DeletionPriority == nil) != (gs.Spec.DeletionPriority == nil) ||
+				(oldGsSpec.DeletionPriority != nil && gs.Spec.DeletionPriority != nil && *oldGsSpec.DeletionPriority != *gs.Spec.DeletionPriority) {
+				specPatch["deletionPriority"] = gs.Spec.DeletionPriority
+			}
+			// networkDisabled
+			oldNetworkDisabled := ptr.Deref(oldGsSpec.NetworkDisabled, false)
+			newNetworkDisabled := ptr.Deref(gs.Spec.NetworkDisabled, false)
+			if (oldGsSpec.NetworkDisabled == nil) != (gs.Spec.NetworkDisabled == nil) || oldNetworkDisabled != newNetworkDisabled {
+				specPatch["networkDisabled"] = gs.Spec.NetworkDisabled
+			}
+			if len(specPatch) > 0 {
+				patch["spec"] = specPatch
+			}
+		}
+
+		// Metadata changes (labels/annotations) are safe to include fully
+		if !reflect.DeepEqual(oldGsLabels, gs.GetLabels()) || !reflect.DeepEqual(oldGsAnnotations, gs.GetAnnotations()) {
+			patch["metadata"] = map[string]interface{}{
+				"labels":      gs.GetLabels(),
+				"annotations": gs.GetAnnotations(),
+			}
+		}
+
+		if len(patch) > 0 {
+			specFieldCount := 0
+			if specPatch, ok := patch["spec"].(map[string]interface{}); ok {
+				specFieldCount = len(specPatch)
+			}
+			_, metadataChanged := patch["metadata"]
+			addManagerSpanEvent(ctx, "gameserver.manager.patch_gameserver",
+				tracing.AttrGameServerName(gs.GetName()),
+				attribute.Int("specFields", specFieldCount),
+				attribute.Bool("metadataChanged", metadataChanged),
+			)
+			jsonPatchSpec, err := json.Marshal(patch)
+			if err != nil {
+				return err
+			}
+			err = manager.client.Patch(ctx, gs, client.RawPatch(types.MergePatchType, jsonPatchSpec))
+			if err != nil && !errors.IsNotFound(err) {
+				manager.logger.Error(err, "failed to patch GameServer spec/metadata",
+					telemetryfields.FieldGameServerNamespace, gs.GetNamespace(),
+					telemetryfields.FieldGameServerName, gs.GetName())
+				return err
+			}
 		}
 	}
 
 	// get gs conditions
-	conditions, err := getConditions(context.TODO(), manager.client, gs, manager.eventRecorder)
+	conditions, err := getConditions(ctx, manager.client, gs, manager.eventRecorder)
 	if err != nil {
-		klog.Errorf("failed to get GameServer %s Conditions in %s, because of %s.", gs.GetName(), gs.GetNamespace(), err.Error())
+		manager.logger.Error(err, "failed to get GameServer conditions",
+			telemetryfields.FieldGameServerNamespace, gs.GetNamespace(),
+			telemetryfields.FieldGameServerName, gs.GetName())
 		return err
 	}
 
@@ -302,13 +448,22 @@ func (manager GameServerManager) SyncPodToGs(gss *gameKruiseV1alpha1.GameServerS
 	if !reflect.DeepEqual(oldGsStatus, newStatus) {
 		newStatus.LastTransitionTime = metav1.Now()
 		patchStatus := map[string]interface{}{"status": newStatus}
+		addManagerSpanEvent(ctx, "gameserver.manager.patch_status",
+			tracing.AttrGameServerName(gs.GetName()),
+			attribute.String("currentState", string(newStatus.CurrentState)),
+			attribute.String("desiredState", string(newStatus.DesiredState)),
+			attribute.String(telemetryfields.FieldNetworkDesired, string(newStatus.NetworkStatus.DesiredNetworkState)),
+			attribute.String(telemetryfields.FieldNetworkCurrent, string(newStatus.NetworkStatus.CurrentNetworkState)),
+		)
 		jsonPatchStatus, err := json.Marshal(patchStatus)
 		if err != nil {
 			return err
 		}
-		err = manager.client.Status().Patch(context.TODO(), gs, client.RawPatch(types.MergePatchType, jsonPatchStatus))
+		err = manager.client.Status().Patch(ctx, gs, client.RawPatch(types.MergePatchType, jsonPatchStatus))
 		if err != nil && !errors.IsNotFound(err) {
-			klog.Errorf("failed to patch GameServer Status %s in %s,because of %s.", gs.GetName(), gs.GetNamespace(), err.Error())
+			manager.logger.Error(err, "failed to patch GameServer status",
+				telemetryfields.FieldGameServerNamespace, gs.GetNamespace(),
+				telemetryfields.FieldGameServerName, gs.GetName())
 			return err
 		}
 	}
@@ -321,14 +476,26 @@ func (manager GameServerManager) WaitOrNot() bool {
 	alreadyWait := time.Since(networkStatus.LastTransitionTime.Time)
 	if networkStatus.DesiredNetworkState != networkStatus.CurrentNetworkState {
 		if alreadyWait < NetworkTotalWaitTime {
-			klog.Infof("GameServer %s/%s DesiredNetworkState: %s CurrentNetworkState: %s. %v remaining",
-				manager.gameServer.GetNamespace(), manager.gameServer.GetName(), networkStatus.DesiredNetworkState, networkStatus.CurrentNetworkState, NetworkTotalWaitTime-alreadyWait)
+			manager.logger.Info("waiting for network state",
+				telemetryfields.FieldGameServerNamespace, manager.gameServer.GetNamespace(),
+				telemetryfields.FieldGameServerName, manager.gameServer.GetName(),
+				telemetryfields.FieldDesired, networkStatus.DesiredNetworkState,
+				telemetryfields.FieldCurrent, networkStatus.CurrentNetworkState,
+				telemetryfields.FieldRemaining, NetworkTotalWaitTime-alreadyWait)
 			return true
 		} else {
 			manager.eventRecorder.Eventf(manager.gameServer, corev1.EventTypeWarning, GsNetworkStateReason, "Network wait timeout: waited %v, max %v", alreadyWait, NetworkTotalWaitTime)
 		}
 	}
 	return false
+}
+
+func addManagerSpanEvent(ctx context.Context, name string, attrs ...attribute.KeyValue) {
+	span := trace.SpanFromContext(ctx)
+	if !span.SpanContext().IsValid() {
+		return
+	}
+	span.AddEvent(name, trace.WithAttributes(attrs...))
 }
 
 func (manager GameServerManager) syncNetworkStatus() gameKruiseV1alpha1.NetworkStatus {
@@ -376,7 +543,7 @@ func desiredNetworkState(disabled bool) gameKruiseV1alpha1.NetworkState {
 	return gameKruiseV1alpha1.NetworkReady
 }
 
-func syncServiceQualities(serviceQualities []gameKruiseV1alpha1.ServiceQuality, podConditions []corev1.PodCondition, gs *gameKruiseV1alpha1.GameServer) []gameKruiseV1alpha1.ServiceQualityCondition {
+func syncServiceQualities(serviceQualities []gameKruiseV1alpha1.ServiceQuality, podConditions []corev1.PodCondition, gs *gameKruiseV1alpha1.GameServer, eventRecorder record.EventRecorder) []gameKruiseV1alpha1.ServiceQualityCondition {
 	var newGsConditions []gameKruiseV1alpha1.ServiceQualityCondition
 	sqConditionsMap := make(map[string]gameKruiseV1alpha1.ServiceQualityCondition)
 	for _, sqc := range gs.Status.ServiceQualitiesCondition {
@@ -396,16 +563,69 @@ func syncServiceQualities(serviceQualities []gameKruiseV1alpha1.ServiceQuality, 
 			var lastActionTransitionTime metav1.Time
 			sqCondition, exist := sqConditionsMap[sq.Name]
 			if !exist || ((sqCondition.Status != string(podCondition.Status) || (sqCondition.Result != podConditionMessage)) && (sqCondition.LastActionTransitionTime.IsZero() || !sq.Permanent)) {
-				// exec action
+				// exec action (only apply fields explicitly set in action)
 				for _, action := range sq.ServiceQualityAction {
 					state, err := strconv.ParseBool(string(podCondition.Status))
 					if err == nil && state == action.State && (action.Result == "" || podConditionMessage == action.Result) {
-						gs.Spec.DeletionPriority = action.DeletionPriority
-						gs.Spec.UpdatePriority = action.UpdatePriority
-						gs.Spec.OpsState = action.OpsState
-						gs.Spec.NetworkDisabled = action.NetworkDisabled
-						gs.SetLabels(util.MergeMapString(gs.GetLabels(), action.Labels))
-						gs.SetAnnotations(util.MergeMapString(gs.GetAnnotations(), action.Annotations))
+						// Apply GameServerSpec fields with template support
+						// DeletionPriority: support template variable
+						if action.DeletionPriority != nil {
+							dpStr := action.DeletionPriority.String()
+							if strings.Contains(dpStr, "{{") {
+								// Contains template, need to render and validate
+								parsedDP, err := util.ParseIntOrStringFromTemplate(dpStr, podConditionMessage)
+								if err != nil {
+									eventRecorder.Eventf(gs, corev1.EventTypeWarning, "InvalidDeletionPriority",
+										"Failed to parse DeletionPriority template '%s' with result '%s': %v", dpStr, podConditionMessage, err)
+								} else {
+									gs.Spec.DeletionPriority = parsedDP
+								}
+							} else {
+								// No template, use directly
+								gs.Spec.DeletionPriority = action.DeletionPriority
+							}
+						}
+						// UpdatePriority: support template variable
+						if action.UpdatePriority != nil {
+							upStr := action.UpdatePriority.String()
+							if strings.Contains(upStr, "{{") {
+								// Contains template, need to render and validate
+								parsedUP, err := util.ParseIntOrStringFromTemplate(upStr, podConditionMessage)
+								if err != nil {
+									eventRecorder.Eventf(gs, corev1.EventTypeWarning, "InvalidUpdatePriority",
+										"Failed to parse UpdatePriority template '%s' with result '%s': %v", upStr, podConditionMessage, err)
+								} else {
+									gs.Spec.UpdatePriority = parsedUP
+								}
+							} else {
+								// No template, use directly
+								gs.Spec.UpdatePriority = action.UpdatePriority
+							}
+						}
+						if action.OpsState != "" {
+							// Support template in OpsState
+							renderedOpsState := util.RenderTemplate(string(action.OpsState), podConditionMessage)
+							gs.Spec.OpsState = gameKruiseV1alpha1.OpsState(renderedOpsState)
+						}
+						if action.NetworkDisabled != nil {
+							gs.Spec.NetworkDisabled = ptr.To(ptr.Deref(action.NetworkDisabled, false))
+						}
+						// Apply Labels with template support
+						if len(action.Labels) > 0 {
+							renderedLabels := make(map[string]string)
+							for k, v := range action.Labels {
+								renderedLabels[k] = util.RenderTemplate(v, podConditionMessage)
+							}
+							gs.SetLabels(util.MergeMapString(gs.GetLabels(), renderedLabels))
+						}
+						// Apply Annotations with template support
+						if len(action.Annotations) > 0 {
+							renderedAnnotations := make(map[string]string)
+							for k, v := range action.Annotations {
+								renderedAnnotations[k] = util.RenderTemplate(v, podConditionMessage)
+							}
+							gs.SetAnnotations(util.MergeMapString(gs.GetAnnotations(), renderedAnnotations))
+						}
 						lastActionTransitionTime = timeNow
 					}
 				}
@@ -449,11 +669,12 @@ func (manager GameServerManager) syncPodContainers(gsContainers []gameKruiseV1al
 	return newContainers
 }
 
-func NewGameServerManager(gs *gameKruiseV1alpha1.GameServer, pod *corev1.Pod, c client.Client, recorder record.EventRecorder) Control {
+func NewGameServerManager(gs *gameKruiseV1alpha1.GameServer, pod *corev1.Pod, c client.Client, recorder record.EventRecorder, logger logr.Logger) Control {
 	return &GameServerManager{
 		gameServer:    gs,
 		pod:           pod,
 		client:        c,
 		eventRecorder: recorder,
+		logger:        logger,
 	}
 }

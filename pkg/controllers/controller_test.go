@@ -20,6 +20,7 @@ import (
 	"errors"
 	"testing"
 
+	cpmanager "github.com/openkruise/kruise-game/cloudprovider/manager"
 	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -53,12 +54,12 @@ func TestSetupWithManager_Success(t *testing.T) {
 
 	called := []string{}
 
-	controllerAddFuncs = []func(manager.Manager) error{
-		func(m manager.Manager) error {
+	controllerAddFuncs = []func(manager.Manager, *cpmanager.ProviderManager) error{
+		func(m manager.Manager, cpm *cpmanager.ProviderManager) error {
 			called = append(called, "gameserver")
 			return nil
 		},
-		func(m manager.Manager) error {
+		func(m manager.Manager, cpm *cpmanager.ProviderManager) error {
 			called = append(called, "gameserverset")
 			return nil
 		},
@@ -67,7 +68,7 @@ func TestSetupWithManager_Success(t *testing.T) {
 	indexer := &fakeFieldIndexer{}
 	mgr := &fakeManager{indexer: indexer}
 
-	err := SetupWithManager(mgr)
+	err := SetupWithManager(mgr, nil)
 	assert.NoError(t, err)
 	assert.True(t, indexer.called)
 	assert.Equal(t, []string{"gameserver", "gameserverset"}, called)
@@ -80,7 +81,7 @@ func TestSetupWithManager_IndexerFails(t *testing.T) {
 		},
 	}
 
-	err := SetupWithManager(mgr)
+	err := SetupWithManager(mgr, nil)
 	assert.Error(t, err)
 	assert.EqualError(t, err, "indexer failure")
 }
@@ -90,8 +91,8 @@ func TestSetupWithManager_NoKindMatchError(t *testing.T) {
 	defer func() { controllerAddFuncs = originalFuncs }()
 
 	// Simulate NoKindMatchError
-	controllerAddFuncs = []func(manager.Manager) error{
-		func(m manager.Manager) error {
+	controllerAddFuncs = []func(manager.Manager, *cpmanager.ProviderManager) error{
+		func(m manager.Manager, cpm *cpmanager.ProviderManager) error {
 			return &metav1.NoKindMatchError{
 				GroupKind: schema.GroupKind{
 					Group: "game.kruise.io",
@@ -105,6 +106,6 @@ func TestSetupWithManager_NoKindMatchError(t *testing.T) {
 		indexer: &fakeFieldIndexer{},
 	}
 
-	err := SetupWithManager(mgr)
+	err := SetupWithManager(mgr, nil)
 	assert.NoError(t, err)
 }
